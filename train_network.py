@@ -1450,25 +1450,26 @@ class NetworkTrainer:
                 args.max_train_steps > initial_step
             ), f"max_train_steps should be greater than initial step / max_train_stepsは初期ステップより大きい必要があります: {args.max_train_steps} vs {initial_step}"
 
+        # ANIMA_COLAB_RESUME_POSITION_FIX_V2
+        # Saved train_state.json current_step is counted in optimizer steps.
+        _resumed_optimizer_step = initial_step
         epoch_to_start = 0
+        _batches_to_skip_in_first_epoch = 0
         if initial_step > 0:
+            _steps_per_epoch = math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+            epoch_to_start, _steps_in_epoch = divmod(initial_step, _steps_per_epoch)
             if args.skip_until_initial_step:
-                # if skip_until_initial_step is specified, load data and discard it to ensure the same data is used
                 if not args.resume:
-                    logger.info(
-                        f"initial_step is specified but not resuming. lr scheduler will be started from the beginning / initial_stepが指定されていますがresumeしていないため、lr schedulerは最初から始まります"
-                    )
-                logger.info(f"skipping {initial_step} steps / {initial_step}ステップをスキップします")
-                initial_step *= args.gradient_accumulation_steps
-
-                # set epoch to start to make initial_step less than len(train_dataloader)
-                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
+                    logger.warning("Skipping batches without a state checkpoint: LR scheduler starts fresh.")
+                _batches_to_skip_in_first_epoch = min(
+                    _steps_in_epoch * args.gradient_accumulation_steps,
+                    len(train_dataloader),
+                )
             else:
-                # if not, only epoch no is skipped for informative purpose
-                epoch_to_start = initial_step // math.ceil(len(train_dataloader) / args.gradient_accumulation_steps)
-                initial_step = 0  # do not skip
-
-        global_step = 0
+                _batches_to_skip_in_first_epoch = 0
+        # Dataloader skip uses only the remainder of this epoch, in batches.
+        initial_step = _batches_to_skip_in_first_epoch
+        global_step = _resumed_optimizer_step if args.skip_until_initial_step else 0
 
         noise_scheduler = self.get_noise_scheduler(args, accelerator.device)
 
@@ -1509,11 +1510,7 @@ class NetworkTrainer:
             accelerator.log({}, step=0)
 
         # training loop
-        if initial_step > 0:  # only if skip_until_initial_step is specified
-            for skip_epoch in range(epoch_to_start):  # skip epochs
-                logger.info(f"skipping epoch {skip_epoch+1} because initial_step (multiplied) is {initial_step}")
-                initial_step -= len(train_dataloader)
-            global_step = initial_step
+        # Resume optimizer count restored above; only partial-epoch batches need skipping.
 
         # log device and dtype for each model
         logger.info(f"unet dtype: {unet_weight_dtype}, device: {unet.device}")
@@ -1527,7 +1524,7 @@ class NetworkTrainer:
         clean_memory_on_device(accelerator.device)
 
         progress_bar = tqdm(
-            range(args.max_train_steps - initial_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
+            range(args.max_train_steps - _resumed_optimizer_step), smoothing=0, disable=not accelerator.is_local_main_process, desc="steps"
         )
 
         validation_steps = (
